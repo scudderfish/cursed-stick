@@ -8,6 +8,11 @@
 # Tip: compress to .adz first — FlashFloppy reads them natively and you fit
 # ~2-4x more on the stick:
 #   gzip -9k Lemmings.adf && adfpush Lemmings.adz
+#
+# NOTE: the default host is the mDNS name cursed.local. mDNS is link-local
+# multicast and does NOT cross a router or a VLAN, so if this PC is not on the
+# same layer-2 network as the stick the name will not resolve — set CURSED_HOST
+# to the IP the firmware prints on its UART at boot.
 set -euo pipefail
 
 HOST="${CURSED_HOST:-cursed.local}"
@@ -15,20 +20,44 @@ HOST="${CURSED_HOST:-cursed.local}"
 if [ "$#" -lt 1 ]; then
   echo "usage: adfpush FILE [FILE...]" >&2
   echo "   or: adfpush DIR       (uploads *.adf and *.adz in DIR)" >&2
+  echo "   set CURSED_HOST=<ip-or-name> to point at the stick" >&2
   exit 2
 fi
 
+# Fail fast with something actionable rather than letting every upload hang.
+if ! timeout 5 bash -c "exec 3<>/dev/tcp/${HOST}/80" 2>/dev/null; then
+  echo "adfpush: cannot reach http://${HOST}/" >&2
+  echo "  - is the stick powered up and joined to WiFi? (its IP is on the UART)" >&2
+  echo "  - mDNS (cursed.local) will NOT resolve across a router/VLAN; on a" >&2
+  echo "    different network pass the IP:  CURSED_HOST=172.16.4.15 adfpush FILE" >&2
+  exit 1
+fi
+
 push() {
-  local f="$1"
-  printf '-> %s\n' "$f"
-  curl --fail --silent --show-error -F "file=@${f}" "http://${HOST}/upload" && echo
+  local f="$1" reply code
+  printf '%s\n' "-> $f"
+  if ! reply=$(curl -sS --max-time 600 -w '\n%{http_code}' \
+                   -F "file=@${f}" "http://${HOST}/upload"); then
+    echo "   FAILED: request to ${HOST} failed" >&2
+    return 1
+  fi
+  code="${reply##*$'\n'}"
+  if [ "$code" = "200" ]; then
+    echo "   OK"
+    return 0
+  fi
+  echo "   FAILED: HTTP ${code}: ${reply%$'\n'*}" >&2
+  return 1
 }
 
+rc=0
 for arg in "$@"; do
   if [ -d "$arg" ]; then
-    find "$arg" -maxdepth 1 -type f \( -iname '*.adf' -o -iname '*.adz' \) -print0 |
-      while IFS= read -r -d '' f; do push "$f"; done
+    # Process substitution, not a pipe: 'rc' must survive the loop.
+    while IFS= read -r -d '' f; do push "$f" || rc=1; done \
+      < <(find "$arg" -maxdepth 1 -type f \( -iname '*.adf' -o -iname '*.adz' \) -print0)
   else
-    push "$arg"
+    push "$arg" || rc=1
   fi
 done
+exit "$rc"

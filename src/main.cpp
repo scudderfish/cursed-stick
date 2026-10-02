@@ -110,6 +110,13 @@ static bool rebuildImage() {
   root.close();
 
   uint32_t used = fat16::build(fatImage, g_entries, g_count, littlefsReader, g_paths);
+  // Never leave the cached reader handle open: an open File blocks
+  // LittleFS.remove() of that same file, which silently defeats the
+  // upload rollback and /delete.
+  if (g_currentFile) g_currentFile.close();
+  g_currentIndex = UINT32_MAX;
+  Serial.printf("FAT: build(%u files) -> %s\n", (unsigned)g_count,
+                used == fat16::TOTAL_BYTES ? "ok" : "FAILED (over capacity?)");
   return used == fat16::TOTAL_BYTES;
 }
 
@@ -174,11 +181,31 @@ static void ensureImageACfg() {
 // ---------------------------------------------------------------------------
 WebServer server(80);
 
+// Escape for HTML text and for a single-quoted attribute. Filenames come from
+// multipart uploads, so they are not trusted to be free of markup.
+static String htmlEscape(const String& in) {
+  String out;
+  out.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); i++) {
+    switch (in[i]) {
+      case '&':  out += "&amp;";  break;
+      case '<':  out += "&lt;";   break;
+      case '>':  out += "&gt;";   break;
+      case '"':  out += "&quot;"; break;
+      case '\'': out += "&#39;";  break;
+      default:   out += in[i];
+    }
+  }
+  return out;
+}
+
 static void handleRoot() {
   String html;
-  html.reserve(2048);
+  html.reserve(3072);
   html += "<!doctype html><html><head><meta charset='utf-8'>"
-          "<title>Cursed Gotek ADF stick</title></head><body>";
+          "<title>Cursed Gotek ADF stick</title>"
+          "<style>body{font-family:sans-serif;margin:2rem}"
+          "li{margin:.25rem 0}form{display:inline}</style></head><body>";
   html += "<h1>Cursed Gotek ADF stick</h1>";
   html += "<p>Tip: gzip your ADFs (<code>gzip -9k file.adf</code>) and upload the "
           "<code>.adz</code> — FlashFloppy reads them natively and ~2-4x more fit.</p>";
@@ -188,11 +215,14 @@ static void handleRoot() {
   File root = LittleFS.open("/");
   File f = root.openNextFile();
   while (f) {
-    html += "<li>";
-    html += f.name();
-    html += " (";
-    html += String(f.size());
-    html += " bytes)</li>";
+    if (!f.isDirectory()) {
+      String nm = htmlEscape(f.name());
+      html += "<li>" + nm + " (" + String(f.size()) + " bytes) ";
+      html += "<form method='post' action='/delete' "
+              "onsubmit=\"return confirm('Delete this file from the stick?');\">";
+      html += "<input type='hidden' name='name' value='" + nm + "'>";
+      html += "<button type='submit'>delete</button></form></li>";
+    }
     f = root.openNextFile();
   }
   html += "</ul></body></html>";
@@ -227,7 +257,9 @@ static void handleUploadBody() {
     if (uploadOk) {
       tud_connect();                       // FlashFloppy re-scans on re-enumeration
     } else {
-      LittleFS.remove("/" + uploadName);   // roll back; image full
+      bool removed = LittleFS.remove("/" + uploadName);   // roll back; image full
+      Serial.printf("UPLOAD: '%s' rejected; rollback remove -> %s\n",
+                    uploadName.c_str(), removed ? "ok" : "FAILED");
       rebuildImage();
       tud_connect();
     }
@@ -240,10 +272,13 @@ static void handleDelete() {
     if (n.length() > 1 && n.indexOf("..") < 0) {
       tud_disconnect();
       delay(30);
-      LittleFS.remove(n);
+      bool removed = LittleFS.remove(n);
+      Serial.printf("DELETE: remove('%s') -> %s\n", n.c_str(), removed ? "ok" : "FAILED");
       rebuildImage();
       tud_connect();
     }
+  } else {
+    Serial.println("DELETE: request without a 'name' argument");
   }
   server.sendHeader("Location", "/");
   server.send(302);
@@ -266,8 +301,15 @@ static void connectWiFi() {
     Serial.print(".");
   }
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\nconnected: http://%s.local  (IP %s)\n", HOSTNAME,
-                  WiFi.localIP().toString().c_str());
+    // Modem sleep can make an ESP32 miss inbound frames on some APs; we are a
+    // server, so keep the radio awake. Without this the stick is unreachable
+    // from other subnets while its own outbound connections still work.
+    WiFi.setSleep(false);
+    // Print the IP as the URL: mDNS (cursed.local) is link-local and only
+    // resolves on the same layer-2 network, which is often not the case.
+    Serial.printf("\nconnected: http://%s/  (ssid '%s', rssi %d)\n",
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.SSID().c_str(), WiFi.RSSI());
   } else {
     Serial.println("\nWiFi FAILED — upload via IP once you reconnect, or reboot");
   }

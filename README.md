@@ -72,6 +72,22 @@ gzip -9k Lemmings.adf && tools/adfpush Lemmings.adz
 Each upload rebuilds the image and re-enumerates the USB device, so the new
 files appear on the Gotek immediately.
 
+Browsing to the stick's address gives the file list, an upload form, and a
+**delete** button per file (deleting also re-enumerates USB, so the Gotek
+re-scans):
+
+```
+http://172.16.4.15/
+```
+
+`adfpush` defaults to the mDNS name `cursed.local`. mDNS is link-local and does
+not cross a router or VLAN, so if your PC is on a different network, pass the IP
+the firmware prints on the UART at boot:
+
+```bash
+CURSED_HOST=172.16.4.15 tools/adfpush ~/amiga/adfs/Lemmings.adf
+```
+
 The stick carries a default `FF.CFG` and an empty `IMAGE_A.CFG` (both written
 on first boot), so a factory-fresh Gotek is configured without a hand-prepared
 USB stick. Upload your own `FF.CFG` to override it:

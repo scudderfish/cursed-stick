@@ -2,7 +2,7 @@
 //
 // Presents a read-only FAT16 image (built in PSRAM from LittleFS contents) to
 // the Gotek over the native USB OTG port, and serves a tiny HTTP upload UI on
-// WiFi so ADF/.adz files can be pushed from a PC.
+// WiFi so ADF files can be pushed from a PC.
 //
 // One-way only: the Gotek can never write back (MSC write callback returns -1).
 #include <Arduino.h>
@@ -207,8 +207,8 @@ static void handleRoot() {
           "<style>body{font-family:sans-serif;margin:2rem}"
           "li{margin:.25rem 0}form{display:inline}</style></head><body>";
   html += "<h1>Cursed Gotek ADF stick</h1>";
-  html += "<p>Tip: gzip your ADFs (<code>gzip -9k file.adf</code>) and upload the "
-          "<code>.adz</code> — FlashFloppy reads them natively and ~2-4x more fit.</p>";
+  html += "<p>The 6 MiB image holds about six ADFs. Keep at least one on the "
+          "stick: with none, the Gotek shows <b>E34</b>.</p>";
   html += "<form method='post' action='/upload' enctype='multipart/form-data'>";
   html += "<input type='file' name='file' multiple> <button>Upload</button></form>";
   html += "<h2>Files</h2><ul>";
@@ -234,7 +234,14 @@ static File    uploadFile;
 static String  uploadName;
 
 static void handleUploadDone() {
-  server.send(uploadOk ? 200 : 507, "text/plain", uploadOk ? "OK" : "image full");
+  if (!uploadOk) {
+    server.send(507, "text/plain", "image full");
+    return;
+  }
+  // Bounce the browser back to the file list, exactly as /delete does. Tools
+  // (tools/adfpush) pass curl -L and so still see GET / -> 200.
+  server.sendHeader("Location", "/");
+  server.send(302);
 }
 
 static void handleUploadBody() {

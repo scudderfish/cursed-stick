@@ -14,7 +14,7 @@ PC (adfpush / browser)  ──WiFi──▶  ESP32-S3  ──USB device (MSC, re
 
 ## How it works
 
-- ADF/`.adz` files live in a **LittleFS** partition on the ESP32's flash.
+- ADF disk images live in a **LittleFS** partition on the ESP32's flash.
 - On boot and after every upload, a deterministic **FAT16 image** (6 MiB) is built
   in **PSRAM** containing those files.
 - The native USB port presents that image to the Gotek as a **read-only**
@@ -22,8 +22,9 @@ PC (adfpush / browser)  ──WiFi──▶  ESP32-S3  ──USB device (MSC, re
 - A tiny HTTP server (WiFi + mDNS) accepts uploads and forces a USB
   re-enumeration so FlashFloppy re-scans the directory.
 
-6 MiB of image holds ~6 raw ADFs, or considerably more if you send **`.adz`**
-(gzipped ADF), which FlashFloppy decompresses on the fly.
+The 6 MiB image holds about six ADFs. FlashFloppy needs them uncompressed, so
+compressing the ADFs would not fit any more of them. A stick with no `.adf` on
+it shows **E34** on the Gotek (no usable disk image).
 
 ## Hardware
 
@@ -39,13 +40,15 @@ PC (adfpush / browser)  ──WiFi──▶  ESP32-S3  ──USB device (MSC, re
 
 ## Configure
 
-Edit `src/main.cpp`:
+WiFi credentials live in `include/secrets.h`, which is **gitignored** so they
+cannot be committed:
 
 ```c
 #define WIFI_SSID   "YOUR_WIFI_SSID"
 #define WIFI_PASS   "YOUR_WIFI_PASSWORD"
-#define HOSTNAME    "cursed"          // -> cursed.local
 ```
+
+The mDNS name is `HOSTNAME` in `src/main.cpp` (`cursed` → `cursed.local`).
 
 ## Build & flash
 
@@ -62,15 +65,12 @@ If your module isn't N16R8, adjust `board_build.arduino.memory_type` and
 
 ```bash
 tools/adfpush ~/amiga/adfs/Lemmings.adf
-tools/adfpush ~/amiga/adfs/            # bulk-upload *.adf / *.adz
-```
-
-```bash
-gzip -9k Lemmings.adf && tools/adfpush Lemmings.adz
+tools/adfpush ~/amiga/adfs/            # bulk-upload *.adf
 ```
 
 Each upload rebuilds the image and re-enumerates the USB device, so the new
-files appear on the Gotek immediately.
+files appear on the Gotek immediately; in a browser the page returns to the
+file list once the upload finishes.
 
 Browsing to the stick's address gives the file list, an upload form, and a
 **delete** button per file (deleting also re-enumerates USB, so the Gotek

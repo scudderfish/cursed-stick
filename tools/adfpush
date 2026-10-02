@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# adfpush — push ADF/ADZ files from a PC to the Cursed WiFi stick.
+# adfpush — push ADF disk images from a PC to the Cursed WiFi stick.
 #
 #   adfpush Games/Lemmings.adf
-#   adfpush ~/amiga/adfs/            # all *.adf/*.adz in a directory
-#   CURSED_HOST=192.168.1.50 adfpush file.adz
+#   adfpush ~/amiga/adfs/            # all *.adf in a directory
+#   CURSED_HOST=192.168.1.50 adfpush file.adf
 #
-# Tip: compress to .adz first — FlashFloppy reads them natively and you fit
-# ~2-4x more on the stick:
-#   gzip -9k Lemmings.adf && adfpush Lemmings.adz
+# Any single filename is uploaded as-is (that is how you push FF.CFG); the
+# directory form filters to *.adf.
 #
 # NOTE: the default host is the mDNS name cursed.local. mDNS is link-local
 # multicast and does NOT cross a router or a VLAN, so if this PC is not on the
@@ -19,7 +18,7 @@ HOST="${CURSED_HOST:-cursed.local}"
 
 if [ "$#" -lt 1 ]; then
   echo "usage: adfpush FILE [FILE...]" >&2
-  echo "   or: adfpush DIR       (uploads *.adf and *.adz in DIR)" >&2
+  echo "   or: adfpush DIR       (uploads *.adf in DIR)" >&2
   echo "   set CURSED_HOST=<ip-or-name> to point at the stick" >&2
   exit 2
 fi
@@ -36,7 +35,8 @@ fi
 push() {
   local f="$1" reply code
   printf '%s\n' "-> $f"
-  if ! reply=$(curl -sS --max-time 600 -w '\n%{http_code}' \
+  # /upload 302s to the file list on success, so follow it and read the final code.
+  if ! reply=$(curl -sS -L --max-time 600 -w '\n%{http_code}' \
                    -F "file=@${f}" "http://${HOST}/upload"); then
     echo "   FAILED: request to ${HOST} failed" >&2
     return 1
@@ -55,7 +55,7 @@ for arg in "$@"; do
   if [ -d "$arg" ]; then
     # Process substitution, not a pipe: 'rc' must survive the loop.
     while IFS= read -r -d '' f; do push "$f" || rc=1; done \
-      < <(find "$arg" -maxdepth 1 -type f \( -iname '*.adf' -o -iname '*.adz' \) -print0)
+      < <(find "$arg" -maxdepth 1 -type f -iname '*.adf' -print0)
   else
     push "$arg" || rc=1
   fi

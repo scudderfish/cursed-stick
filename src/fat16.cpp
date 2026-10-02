@@ -46,7 +46,7 @@ static void writeBootSector(uint8_t* buf) {
   buf[0x25] = 0;
   buf[0x26] = 0x29;                                   // extended boot signature
   put32(buf + 0x27, 0x41444631u);                     // volume serial "ADF1"
-  memcpy(buf + 0x2B, "ADFSTICK   ", 11);              // volume label
+  memcpy(buf + 0x2B, "CURSEDSTICK", 11);              // volume label (must equal rootDir's)
   memcpy(buf + 0x36, "FAT16   ", 8);                  // filesystem type
   buf[510] = 0x55; buf[511] = 0xAA;                   // boot signature
 }

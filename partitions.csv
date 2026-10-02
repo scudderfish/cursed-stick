@@ -1,5 +1,5 @@
 # Partition table for 16 MB flash (ESP32-S3, N16R8).
-# 6 MB app slot + ~9.9 MB LittleFS store for ADF/.adz files.
+# 6 MB app slot + ~9.9 MB LittleFS store for ADF files.
 #
 # Name,     Type, SubType,  Offset,   Size,     Flags
 nvs,        data, nvs,      0x9000,   0x5000,

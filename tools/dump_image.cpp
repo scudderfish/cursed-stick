@@ -33,7 +33,7 @@ int main(int argc, char** argv) {
   if (argc < 3) { fprintf(stderr, "usage: %s <image.img> <expected_dir/>\n", argv[0]); return 2; }
 
   std::vector<Src> src;
-  { Src s; s.name = "TurricanII.adz"; fill(s.bytes, "ADZTESTDATA-", 4096); src.push_back(std::move(s)); }
+  { Src s; s.name = "TurricanII.adf"; fill(s.bytes, "ADFTESTDATA-", 4096); src.push_back(std::move(s)); }
   { Src s; s.name = "This Is A Very Long Filename That Exceeds Eight Three.adf";
     fill(s.bytes, "LONGFILE-", 12345); src.push_back(std::move(s)); }
   { Src s; s.name = "short.adf"; fill(s.bytes, "SHORT", 5); src.push_back(std::move(s)); }

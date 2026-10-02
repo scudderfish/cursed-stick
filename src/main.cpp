@@ -199,13 +199,23 @@ static String htmlEscape(const String& in) {
   return out;
 }
 
+// Files the stick must always carry: FlashFloppy needs IMAGE_A.CFG to exist on
+// a read-only volume (a missing one is fatal -> *FATFS* 04) and FF.CFG configures
+// the Gotek. Both are written only in setup(), so losing one breaks the Gotek
+// until the next boot. Match on the basename, which is what both the file list
+// and /delete carry.
+static bool isRequiredFile(const String& name) {
+  String base = name.substring(name.lastIndexOf('/') + 1);
+  return base == "FF.CFG" || base == "IMAGE_A.CFG";
+}
+
 static void handleRoot() {
   String html;
   html.reserve(3072);
   html += "<!doctype html><html><head><meta charset='utf-8'>"
           "<title>Cursed Gotek ADF stick</title>"
           "<style>body{font-family:sans-serif;margin:2rem}"
-          "li{margin:.25rem 0}form{display:inline}</style></head><body>";
+          "li{margin:.25rem 0}form{display:inline}.req{color:#888}</style></head><body>";
   html += "<h1>Cursed Gotek ADF stick</h1>";
   html += "<p>The 6 MiB image holds about six ADFs. Keep at least one on the "
           "stick: with none, the Gotek shows <b>E34</b>.</p>";
@@ -218,10 +228,15 @@ static void handleRoot() {
     if (!f.isDirectory()) {
       String nm = htmlEscape(f.name());
       html += "<li>" + nm + " (" + String(f.size()) + " bytes) ";
-      html += "<form method='post' action='/delete' "
-              "onsubmit=\"return confirm('Delete this file from the stick?');\">";
-      html += "<input type='hidden' name='name' value='" + nm + "'>";
-      html += "<button type='submit'>delete</button></form></li>";
+      if (isRequiredFile(f.name())) {
+        html += "<span class='req'>required</span>";   // /delete refuses these too
+      } else {
+        html += "<form method='post' action='/delete' "
+                "onsubmit=\"return confirm('Delete this file from the stick?');\">";
+        html += "<input type='hidden' name='name' value='" + nm + "'>";
+        html += "<button type='submit'>delete</button></form>";
+      }
+      html += "</li>";
     }
     f = root.openNextFile();
   }
@@ -276,6 +291,12 @@ static void handleUploadBody() {
 static void handleDelete() {
   if (server.hasArg("name")) {
     String n = "/" + server.arg("name");
+    if (isRequiredFile(n)) {
+      Serial.printf("DELETE: refused to remove required file '%s'\n", n.c_str());
+      server.send(403, "text/plain",
+                  n + " is required on the stick and cannot be deleted");
+      return;
+    }
     if (n.length() > 1 && n.indexOf("..") < 0) {
       tud_disconnect();
       delay(30);

@@ -1,8 +1,9 @@
-// dump_image.cpp — host-side harness to exercise fat16::build() and
+// dump_image.cpp — host-side harness for fat16::layout()/fat16::readBytes() and
 // fat16::storableName() (the name /upload falls back to when the filesystem
 // refuses what the client sent).
-// Builds a sample FAT16 image and writes it (and the source files) to disk
-// so tools/host_check.sh can validate with fsck.fat + mtools.
+// Builds a sample FAT16 volume by rendering every sector through readBytes() —
+// the same call the device's MSC callback makes — and writes it (and the source
+// files) to disk so tools/host_check.sh can validate with fsck.fat + mtools.
 //
 //   g++ -std=c++17 -I include src/fat16.cpp tools/dump_image.cpp -o dump_image
 //   ./dump_image <image.img> <expected_dir/>
@@ -147,10 +148,66 @@ int main(int argc, char** argv) {
   std::vector<fat16::FileEntry> entries;
   for (auto& s : src) entries.push_back({ s.name.c_str(), (uint32_t)s.bytes.size() });
 
+  fat16::Volume vol;
+  if (!fat16::layout(entries.data(), (uint32_t)entries.size(), &vol)) {
+    fprintf(stderr, "layout failed\n"); return 1;
+  }
+
+  // Render the volume exactly the way the device's MSC callback does: every byte
+  // is produced on demand by fat16::readBytes(). The fsck.fat + mtools checks
+  // below therefore validate the streamed result, not a one-shot buffer.
   std::vector<uint8_t> img(fat16::TOTAL_BYTES);
-  uint32_t used = fat16::build(img.data(), entries.data(), (uint32_t)entries.size(),
-                               reader, &src);
-  if (used != fat16::TOTAL_BYTES) { fprintf(stderr, "build failed: %u\n", used); return 1; }
+  for (uint32_t off = 0; off < fat16::TOTAL_BYTES; off += fat16::BYTES_PER_SECTOR) {
+    if (!fat16::readBytes(vol, entries.data(), reader, &src, off,
+                          img.data() + off, fat16::BYTES_PER_SECTOR)) {
+      fprintf(stderr, "readBytes failed at offset %u\n", off); return 1;
+    }
+  }
+
+  // The MSC callback may ask for any (offset, length), so a request that does
+  // not line up with a sector boundary or a file boundary must return the same
+  // bytes as the whole-sector render above.
+  {
+    std::vector<uint8_t> scratch(4096);
+    bool same = true;
+    for (uint32_t off = 0; off + 4096 <= fat16::TOTAL_BYTES && same; off += 4096) {
+      same = fat16::readBytes(vol, entries.data(), reader, &src, off + 1,
+                              scratch.data(), 4096 - 3) &&
+             memcmp(scratch.data(), img.data() + off + 1, 4096 - 3) == 0;
+      if (!same) break;
+      same = fat16::readBytes(vol, entries.data(), reader, &src, off + 3000,
+                              scratch.data(), 512) &&
+             memcmp(scratch.data(), img.data() + off + 3000, 512) == 0;
+    }
+    printf("  %-101s %s\n", "partial reads match whole-sector reads", same ? "ok" : "MISMATCH");
+    if (!same) { fprintf(stderr, "partial read mismatch\n"); return 1; }
+  }
+
+  // The volume spans the whole LittleFS partition, so a file larger than it (or
+  // a set of names too long for the 512-entry root directory) must be refused by
+  // layout() rather than wrapped around into other files' clusters.
+  {
+    fat16::FileEntry big[1] = { { "too-big.adf", fat16::TOTAL_BYTES } };
+    fat16::Volume v;
+    bool refused = !fat16::layout(big, 1, &v);
+    printf("  %-101s %s\n", "file larger than the volume refused", refused ? "ok" : "MISMATCH");
+    if (!refused) { fprintf(stderr, "layout accepted an oversized file\n"); return 1; }
+  }
+  {
+    static std::string names[fat16::MAX_FILES];
+    fat16::FileEntry many[fat16::MAX_FILES];
+    for (uint32_t i = 0; i < fat16::MAX_FILES; i++) {
+      names[i] = "Disk " + std::to_string(i) + " ";
+      while (names[i].size() < 251) names[i] += "Y";   // 255 bytes with ".adf"
+      names[i] += ".adf";
+      many[i].name = names[i].c_str();
+      many[i].size = 1024;
+    }
+    fat16::Volume v;
+    bool refused = !fat16::layout(many, fat16::MAX_FILES, &v);
+    printf("  %-101s %s\n", "root directory overflow refused", refused ? "ok" : "MISMATCH");
+    if (!refused) { fprintf(stderr, "layout overfilled the root directory\n"); return 1; }
+  }
 
   FILE* f = fopen(argv[1], "wb");
   if (!f) { perror("fopen image"); return 1; }

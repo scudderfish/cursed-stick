@@ -9,29 +9,34 @@ it over WiFi. Deliberately read-only (for now) to avoid any write conflicts and 
 
 ```
 PC (adfpush / browser)  ──WiFi──▶  ESP32-S3  ──USB device (MSC, read-only)──▶  Gotek ──▶ Amiga
-                                    LittleFS ─▶ FAT16 image (PSRAM)
+                                    LittleFS ─▶ FAT16 volume (computed per sector)
 ```
 
 ## How it works
 
 - ADF disk images live in a **LittleFS** partition on the ESP32's flash.
-- On boot and after every upload, a deterministic **FAT16 image** (6 MiB) is built
-  in **PSRAM** containing those files.
+- On boot and after every upload, the stick recomputes a deterministic **FAT16
+  volume** over those files: every sector is generated as the Gotek asks for it,
+  so nothing is copied into RAM and no PSRAM is needed.
 - The native USB port presents that image to the Gotek as a **read-only**
   mass-storage device (TinyUSB MSC). FlashFloppy reads it as an ordinary stick.
 - A tiny HTTP server (WiFi + mDNS) accepts uploads and forces a USB
   re-enumeration so FlashFloppy re-scans the directory.
 
-The 6 MiB image holds about six ADFs. FlashFloppy needs them uncompressed, so
-compressing the ADFs would not fit any more of them. A stick with no `.adf` on
-it shows **E34** on the Gotek (no usable disk image).
+The volume spans the whole filesystem partition, so about eleven ADFs fit.
+FlashFloppy needs them uncompressed, so compressing the ADFs would not fit any
+more of them. A stick with no `.adf` on it shows **E34** on the Gotek (no usable
+disk image).
 
 ## Hardware
 
-- ESP32-S3 with **native USB (OTG)** and **PSRAM** — e.g. ESP32-S3-DevKitC-1 with
-  an **N16R8** module (16 MB flash + 8 MB PSRAM).
-  - Only S2 / S3 / C6 / P4 have the OTG peripheral. A classic ESP32 or an
-    ESP32-C3 will **not** work.
+- An ESP32 with **native USB-OTG** and WiFi — an **ESP32-S3** (e.g.
+  ESP32-S3-DevKitC-1 with a 16 MB flash module; an **N16R8** is on the bench
+  here, though its PSRAM is no longer used). An **ESP32-S2** also works.
+  - The chip needs a USB-**OTG device** peripheral, so only the **S2, S3 and P4**
+    qualify. The C3, C6, C2/C61 and H2 have only a USB-Serial/JTAG controller (a
+    fixed CDC/JTAG port — it cannot present a disk at all), and a classic ESP32
+    has no USB peripheral. The P4 has OTG but no WiFi radio.
 - USB cable from the ESP32's **native USB** port (not the UART bridge port) to
   the Gotek's USB-A socket.
 - Power the ESP32 from its own supply/pins. A dev board can usually run off the
@@ -59,7 +64,7 @@ pio device monitor      # UART log (115200)
 ```
 
 If your module isn't N16R8, adjust `board_build.arduino.memory_type` and
-`partitions.csv` to match its flash/PSRAM size.
+`partitions.csv` to match its flash size.
 
 ## Use
 

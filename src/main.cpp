@@ -1,8 +1,9 @@
 // main.cpp — Gotek WiFi "USB stick" (ESP32-S3, Arduino framework).
 //
-// Presents a read-only FAT16 image (built in PSRAM from LittleFS contents) to
-// the Gotek over the native USB OTG port, and serves a tiny HTTP upload UI on
-// WiFi so ADF files can be pushed from a PC.
+// Presents a read-only FAT16 volume, computed on demand from the LittleFS
+// contents (no ADF-sized buffer exists anywhere), to the Gotek over the native
+// USB OTG port, and serves a tiny HTTP upload UI on WiFi so ADF files can be
+// pushed from a PC.
 //
 // One-way only: the Gotek can never write back (MSC write callback returns -1).
 #include <Arduino.h>
@@ -18,12 +19,13 @@
 
 #include "fat16.h"
 
-#include "secrets.h"  // WIFI_SSID, WIFI_PASS
+#include "secrets.h" // WIFI_SSID, WIFI_PASS
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 // ---------------------------------------------------------------------------
 // configuration
 // ---------------------------------------------------------------------------
 #define HOSTNAME    "cursed"
-#define MAX_FILES   64
 
 // Longest filename an upload will try to store: 255 bytes, the VFAT LFN limit —
 // which is also what a firmware-formatted LittleFS accepts (measured on
@@ -39,7 +41,30 @@
 // USB mass storage (read-only)
 // ---------------------------------------------------------------------------
 USBMSC usb_msc;
-static uint8_t* fatImage = nullptr;  // fat16::TOTAL_BYTES, allocated from PSRAM
+
+// The volume layout and the file list it describes. `Volume` is a few hundred
+// bytes of placement state: every byte the host reads is computed on demand by
+// fat16::readBytes(), so the firmware holds no copy of the ADFs at all (and
+// needs no PSRAM). The reader and the path table it opens from are defined with
+// the LittleFS code below, and declared here because the MSC callback needs
+// them.
+static fat16::Volume    g_volume;
+static fat16::FileEntry g_entries[fat16::MAX_FILES];
+static String           g_paths[fat16::MAX_FILES];
+static bool littlefsReader(void* ctx, uint32_t fileIndex, uint32_t offset,
+                           uint8_t* dst, uint32_t n);
+
+// The USB task serves sectors from this state while the HTTP task rewrites it on
+// every upload or delete. `tud_disconnect()` only stops *new* transfers — a
+// callback already running carries on for up to a 64 KiB multi-sector read — so
+// both sides take this lock. The USB task can only ever wait for the
+// microseconds a relayout takes; the HTTP task for the length of one transfer.
+static SemaphoreHandle_t g_volumeLock = nullptr;
+
+struct VolumeLock {
+  VolumeLock()  { xSemaphoreTake(g_volumeLock, portMAX_DELAY); }
+  ~VolumeLock() { xSemaphoreGive(g_volumeLock); }
+};
 
 // Sector traffic counters, reported over UART (see loop()). A host that has
 // mounted the stick reads sectors; a host that mounted and then failed shows
@@ -49,9 +74,12 @@ static volatile uint32_t g_mscWrites = 0;
 
 static int32_t mscRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
   uint32_t byte = lba * fat16::BYTES_PER_SECTOR + offset;
-  if (byte + bufsize > fat16::TOTAL_BYTES) return -1;
   g_mscReads++;
-  memcpy(buffer, fatImage + byte, bufsize);
+  VolumeLock lock;
+  if (!fat16::readBytes(g_volume, g_entries, littlefsReader, g_paths, byte,
+                        (uint8_t*)buffer, bufsize)) {
+    return -1;
+  }
   return (int32_t)bufsize;
 }
 
@@ -80,10 +108,8 @@ extern "C" bool tud_msc_is_writable_cb(uint8_t lun) {
 // ---------------------------------------------------------------------------
 // LittleFS -> FAT16 image
 // ---------------------------------------------------------------------------
-static String        g_names[MAX_FILES];   // basename only, for FAT dir entries
-static String        g_paths[MAX_FILES];   // full LittleFS path, for open()
+static String        g_names[fat16::MAX_FILES];   // basename only, for FAT dir entries
 static uint32_t      g_count = 0;
-static fat16::FileEntry g_entries[MAX_FILES];
 static File          g_currentFile;
 static uint32_t      g_currentIndex = UINT32_MAX;
 
@@ -100,14 +126,26 @@ static bool littlefsReader(void* ctx, uint32_t fileIndex, uint32_t offset,
   return g_currentFile.read(dst, n) == (int)n;
 }
 
-// Rebuild the PSRAM FAT image from everything currently in LittleFS.
-// Call only while the USB host is disconnected (or before begin()).
-static bool rebuildImage() {
+// Drop the cached reader handle. The MSC read path leaves the last file the host
+// read open (littlefsReader caches it for sequential reads), and an open File
+// blocks LittleFS.remove() of that same file — so anything that removes or
+// overwrites a file must invalidate the cache first, under the volume lock.
+static void closeCachedReader() {
+  if (g_currentFile) g_currentFile.close();
+  g_currentIndex = UINT32_MAX;
+}
+
+// Recompute the volume layout from everything currently in LittleFS. No file
+// data is read here (the host pulls that as it asks for sectors), so this is
+// instant even with a full stick. Call only while the USB host is disconnected
+// (or before begin()).
+static bool rebuildVolume() {
+  VolumeLock lock;
   g_count = 0;
   File root = LittleFS.open("/");
   if (!root || !root.isDirectory()) return false;
   File f = root.openNextFile();
-  while (f && g_count < MAX_FILES) {
+  while (f && g_count < fat16::MAX_FILES) {
     if (!f.isDirectory()) {
       g_names[g_count] = f.name();               // basename only, e.g. "FF.CFG"
       g_paths[g_count] = f.path();               // e.g. "/FF.CFG" — name() lacks the '/'
@@ -120,15 +158,12 @@ static bool rebuildImage() {
   f.close();
   root.close();
 
-  uint32_t used = fat16::build(fatImage, g_entries, g_count, littlefsReader, g_paths);
-  // Never leave the cached reader handle open: an open File blocks
-  // LittleFS.remove() of that same file, which silently defeats the
-  // upload rollback and /delete.
-  if (g_currentFile) g_currentFile.close();
-  g_currentIndex = UINT32_MAX;
-  Serial.printf("FAT: build(%u files) -> %s\n", (unsigned)g_count,
-                used == fat16::TOTAL_BYTES ? "ok" : "FAILED (over capacity?)");
-  return used == fat16::TOTAL_BYTES;
+  bool ok = fat16::layout(g_entries, g_count, &g_volume);
+  closeCachedReader();
+  Serial.printf("FAT: layout(%u files, %u root entries) -> %s\n",
+                (unsigned)g_count, (unsigned)g_volume.rootEntries,
+                ok ? "ok" : "FAILED (over capacity?)");
+  return ok;
 }
 
 // FlashFloppy reads FF.CFG from the root of the stick to configure the Gotek.
@@ -228,8 +263,8 @@ static void handleRoot() {
           "<style>body{font-family:sans-serif;margin:2rem}"
           "li{margin:.25rem 0}form{display:inline}.req{color:#888}</style></head><body>";
   html += "<h1>Cursed Gotek ADF stick</h1>";
-  html += "<p>The 6 MiB image holds about six ADFs. Keep at least one on the "
-          "stick: with none, the Gotek shows <b>E34</b>.</p>";
+  html += "<p>The volume spans the whole filesystem — about eleven ADFs. Keep at "
+          "least one on the stick: with none, the Gotek shows <b>E34</b>.</p>";
   html += "<form method='post' action='/upload' enctype='multipart/form-data'>";
   html += "<input type='file' name='file' multiple> <button>Upload</button></form>";
   html += "<h2>Files</h2><ul>";
@@ -297,13 +332,14 @@ static void handleUploadBody() {
 
     // Store the name the client sent wherever the filesystem allows it: it does
     // NOT have to be an 8.3 name, because the name the Gotek sees is generated
-    // from whatever is stored (rebuildImage() -> fat16::build() makes the short
+    // from whatever is stored (rebuildVolume() -> fat16::layout() makes the short
     // name and the VFAT LFN). LittleFS can still refuse a long name outright,
     // though — a filesystem written by `pio run -t uploadfs` keeps its 32-byte
     // name_max for the rest of its life (mklittlefs records it in the superblock
     // and lfs_mount() adopts it, see AGENTS.md) — so fall back to the longest
     // deterministic shortening the filesystem actually accepts.
     errno = 0;
+    { VolumeLock lock; closeCachedReader(); }   // no stale handle on a file we overwrite
     uploadFile = LittleFS.open("/" + uploadName, "w");
     if (!uploadFile) {
       Serial.printf("UPLOAD: cannot store '%s' (errno %d%s)\n",
@@ -353,10 +389,11 @@ static void handleUploadBody() {
       // Remove the partial file so nothing half-written is left behind.
       tud_disconnect();
       delay(30);
-      bool removed = LittleFS.remove("/" + uploadName);
+      bool removed;
+      { VolumeLock lock; closeCachedReader(); removed = LittleFS.remove("/" + uploadName); }
       Serial.printf("UPLOAD: '%s' discarded; remove -> %s\n",
                     uploadName.c_str(), removed ? "ok" : "FAILED");
-      rebuildImage();
+      rebuildVolume();
       tud_connect();
       return;
     }
@@ -364,14 +401,15 @@ static void handleUploadBody() {
     // Rebuild while the host is disconnected to avoid torn reads.
     tud_disconnect();
     delay(30);
-    uploadOk = rebuildImage();
+    uploadOk = rebuildVolume();
     if (uploadOk) {
       tud_connect();                       // FlashFloppy re-scans on re-enumeration
     } else {
-      bool removed = LittleFS.remove("/" + uploadName);   // roll back; image full
+      bool removed;
+      { VolumeLock lock; closeCachedReader(); removed = LittleFS.remove("/" + uploadName); }
       Serial.printf("UPLOAD: '%s' rejected; rollback remove -> %s\n",
                     uploadName.c_str(), removed ? "ok" : "FAILED");
-      rebuildImage();
+      rebuildVolume();
       tud_connect();
     }
   }
@@ -389,9 +427,13 @@ static void handleDelete() {
     if (n.length() > 1 && n.indexOf("..") < 0) {
       tud_disconnect();
       delay(30);
-      bool removed = LittleFS.remove(n);
+      // The host may have read this very file: drop the cached handle before the
+      // remove, or LittleFS refuses to unlink an open file and the disk silently
+      // stays on the stick.
+      bool removed;
+      { VolumeLock lock; closeCachedReader(); removed = LittleFS.remove(n); }
       Serial.printf("DELETE: remove('%s') -> %s\n", n.c_str(), removed ? "ok" : "FAILED");
-      rebuildImage();
+      rebuildVolume();
       tud_connect();
     }
   } else {
@@ -409,8 +451,12 @@ static void handleNotFound() {
 // WiFi
 // ---------------------------------------------------------------------------
 static void connectWiFi() {
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(WIFI_STA);            // brings the driver up, so setSleep() is valid here
   WiFi.setHostname(HOSTNAME);
+  // Modem sleep is off before associating as well as after: WiFi.begin() returns
+  // before the 4-way handshake completes, and this is the same setting the
+  // gotcha above is about.
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("connecting to WiFi");
   for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
@@ -437,9 +483,9 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
-  fatImage = (uint8_t*)heap_caps_malloc(fat16::TOTAL_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!fatImage) {
-    Serial.println("FATAL: could not allocate 6 MiB PSRAM image (need an 8 MiB PSRAM module)");
+  g_volumeLock = xSemaphoreCreateMutex();
+  if (!g_volumeLock) {
+    Serial.println("FATAL: could not create the volume lock");
     for (;;) delay(1000);
   }
 
@@ -448,11 +494,11 @@ void setup() {
     for (;;) delay(1000);
   }
 
-  Serial.println("building initial FAT16 image...");
+  Serial.println("building initial volume layout...");
   ensureDefaultConfig();
   ensureImageACfg();
-  if (rebuildImage()) Serial.printf("  done (%u files)\n", g_count);
-  else                Serial.println("  empty or over-capacity (rebuild on upload)");
+  if (rebuildVolume()) Serial.printf("  done (%u files)\n", g_count);
+  else                 Serial.println("  empty or over-capacity (rebuild on upload)");
 
   usb_msc.vendorID("Pi Gotek");
   usb_msc.productID("ADF Stick");

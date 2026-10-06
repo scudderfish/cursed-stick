@@ -1,11 +1,15 @@
-// fat16.cpp — deterministic FAT16 image builder.
+// fat16.cpp — deterministic FAT16 volume, generated on demand.
 //
+// layout() decides where everything goes (a few hundred bytes of state in
+// Volume); readBytes() then answers any byte range of the volume from that
+// state, pulling file data through the caller's FileReader. Nothing here
+// allocates a file-sized buffer, so the firmware holds no copy of the ADFs and
+// needs no PSRAM.
 #include "fat16.h"
 
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
-#include <stdlib.h>
 
 namespace fat16 {
 
@@ -23,6 +27,8 @@ static inline void put32(uint8_t* p, uint32_t v) {
   p[3] = (uint8_t)((v >> 24) & 0xFF);
 }
 
+static const char VOLUME_LABEL[11] = { 'C','U','R','S','E','D','S','T','I','C','K' };
+
 // ---------------------------------------------------------------------------
 // boot sector
 // ---------------------------------------------------------------------------
@@ -31,55 +37,30 @@ static void writeBootSector(uint8_t* buf) {
   buf[0] = 0xEB; buf[1] = 0x3C; buf[2] = 0x90;
   memcpy(buf + 3, "MSDOS5.0", 8);
   put16(buf + 0x0B, BYTES_PER_SECTOR);                 // bytes per sector
-  buf[0x0D] = (uint8_t)SECTORS_PER_CLUSTER;           // sectors per cluster
-  put16(buf + 0x0E, RESERVED_SECTORS);                // reserved sectors
-  buf[0x10] = (uint8_t)NUM_FATS;                      // number of FATs
-  put16(buf + 0x11, ROOT_ENTRIES);                    // root directory entries
-  put16(buf + 0x13, TOTAL_SECTORS);                   // total sectors (16-bit)
-  buf[0x15] = 0xF8;                                   // media descriptor (fixed disk)
-  put16(buf + 0x16, FAT_SECTORS);                     // sectors per FAT
-  put16(buf + 0x18, 63);                              // sectors per track (cosmetic)
-  put16(buf + 0x1A, 255);                             // heads (cosmetic)
-  put32(buf + 0x1C, 0);                               // hidden sectors
-  put32(buf + 0x20, 0);                               // total sectors (32-bit, unused FAT16)
-  buf[0x24] = 0x80;                                   // drive number
+  buf[0x0D] = (uint8_t)SECTORS_PER_CLUSTER;            // sectors per cluster
+  put16(buf + 0x0E, RESERVED_SECTORS);                 // reserved sectors
+  buf[0x10] = (uint8_t)NUM_FATS;                       // number of FATs
+  put16(buf + 0x11, ROOT_ENTRIES);                     // root directory entries
+  put16(buf + 0x13, TOTAL_SECTORS);                    // total sectors (16-bit)
+  buf[0x15] = 0xF8;                                    // media descriptor (fixed disk)
+  put16(buf + 0x16, FAT_SECTORS);                      // sectors per FAT
+  put16(buf + 0x18, 63);                               // sectors per track (cosmetic)
+  put16(buf + 0x1A, 255);                              // heads (cosmetic)
+  put32(buf + 0x1C, 0);                                // hidden sectors
+  put32(buf + 0x20, 0);                                // total sectors (32-bit, unused FAT16)
+  buf[0x24] = 0x80;                                    // drive number
   buf[0x25] = 0;
-  buf[0x26] = 0x29;                                   // extended boot signature
-  put32(buf + 0x27, 0x41444631u);                     // volume serial "ADF1"
-  memcpy(buf + 0x2B, "CURSEDSTICK", 11);              // volume label (must equal rootDir's)
-  memcpy(buf + 0x36, "FAT16   ", 8);                  // filesystem type
-  buf[510] = 0x55; buf[511] = 0xAA;                   // boot signature
-}
-
-// ---------------------------------------------------------------------------
-// FAT
-// ---------------------------------------------------------------------------
-static inline uint8_t* fatPtr(uint8_t* buf, int fatIndex) {
-  return buf + (uint32_t)(FAT1_SECTOR + fatIndex * FAT_SECTORS) * BYTES_PER_SECTOR;
-}
-
-static void initFats(uint8_t* buf) {
-  for (int f = 0; f < NUM_FATS; f++) {
-    uint8_t* fat = fatPtr(buf, f);
-    memset(fat, 0, FAT_SECTORS * BYTES_PER_SECTOR);
-    fat[0] = 0xF8; fat[1] = 0xFF;    // FAT[0] = 0xFFF8
-    fat[2] = 0xFF; fat[3] = 0xFF;    // FAT[1] = 0xFFFF
-  }
-}
-
-static void setFatEntry(uint8_t* buf, uint32_t cluster, uint16_t value) {
-  uint32_t off = cluster * 2;
-  for (int f = 0; f < NUM_FATS; f++) put16(fatPtr(buf, f) + off, value);
-}
-
-static inline uint8_t* dataPtr(uint8_t* buf, uint32_t cluster) {
-  return buf + (uint32_t)(DATA_SECTOR + (cluster - 2) * SECTORS_PER_CLUSTER) * BYTES_PER_SECTOR;
+  buf[0x26] = 0x29;                                    // extended boot signature
+  put32(buf + 0x27, 0x41444631u);                      // volume serial "ADF1"
+  memcpy(buf + 0x2B, VOLUME_LABEL, 11);                // volume label (must equal rootDir's)
+  memcpy(buf + 0x36, "FAT16   ", 8);                   // filesystem type
+  buf[510] = 0x55; buf[511] = 0xAA;                    // boot signature
 }
 
 // ---------------------------------------------------------------------------
 // short names (8.3)
 // ---------------------------------------------------------------------------
-uint8_t lfnChecksum(const uint8_t shortName[11]) {
+static uint8_t lfnChecksum(const uint8_t shortName[11]) {
   uint8_t sum = 0;
   for (int i = 0; i < 11; i++) sum = (uint8_t)(((sum & 1) << 7) + (sum >> 1) + shortName[i]);
   return sum;
@@ -204,9 +185,9 @@ static bool resolveShortNames(const FileEntry* files, uint32_t count, ShortName*
 // ---------------------------------------------------------------------------
 // storage-safe names (LittleFS)
 // ---------------------------------------------------------------------------
-// The FAT-facing name is generated by build(); this maps a name the *filesystem*
-// will accept. It lives here because fat16.cpp is the only unit the host check
-// compiles (see tools/host_check.sh).
+// The FAT-facing name is generated by layout(); this maps a name the
+// *filesystem* will accept. It lives here because fat16.cpp is the only unit
+// the host check compiles (see tools/host_check.sh).
 
 // FNV-1a — small, allocation-free and stable across builds, unlike std::hash.
 static uint32_t digestOf(const char* s) {
@@ -294,105 +275,221 @@ static void writeShortEntry(uint8_t* entry, const uint8_t shortName[11],
   put32(entry + 28, size);
 }
 
-// ---------------------------------------------------------------------------
-// build
-// ---------------------------------------------------------------------------
-uint32_t build(uint8_t* buf, const FileEntry* files, uint32_t count,
-               FileReader reader, void* ctx) {
-  if (!buf) return 0;
-  if (count && (!files || !reader)) return 0;
+// LFN entries for one file, written the way the volume stores them: highest
+// chunk first (seq 0x40|N), lowest last (seq 1).
+static uint32_t lfnEntryCount(const char* name, uint32_t nameLen) {
+  (void)name;
+  return (nameLen + 1 + 12) / 13;   // + null terminator, 13 chars per entry
+}
 
-  // boot sector, FATs, root dir, data region
-  writeBootSector(buf);
-  initFats(buf);
-  uint8_t* rootDir = buf + (uint32_t)ROOT_SECTOR * BYTES_PER_SECTOR;
-  memset(rootDir, 0, ROOT_DIR_SECTORS * BYTES_PER_SECTOR);
-  memset(buf + (uint32_t)DATA_SECTOR * BYTES_PER_SECTOR, 0,
-         DATA_SECTORS * BYTES_PER_SECTOR);
-
-  // volume label entry (optional, matches mkfs.fat)
-  {
-    uint8_t* e = rootDir  ;
-    memcpy(e, "CURSEDSTICK", 11);
-    e[11] = 0x08;                   // volume label attribute
+static void writeOneLfnChunk(const char* name, uint32_t nameLen, uint32_t chunkIndex,
+                             uint32_t lfnCount, uint8_t checksum, uint8_t* entry) {
+  uint16_t chunk[13];
+  for (int k = 0; k < 13; k++) {
+    uint32_t idx = chunkIndex * 13 + (uint32_t)k;
+    if (idx < nameLen)       chunk[k] = (uint16_t)(uint8_t)name[idx];  // ASCII
+    else if (idx == nameLen) chunk[k] = 0x0000;                        // terminator
+    else                     chunk[k] = 0xFFFF;                        // padding
   }
+  uint8_t seq = (uint8_t)(chunkIndex + 1);
+  if (chunkIndex == lfnCount - 1) seq |= 0x40;
+  writeLfnEntry(entry, seq, chunk, checksum);
+}
 
-  ShortName* shortNames = (ShortName*)calloc(count ? count : 1, sizeof(ShortName));
-  if (!shortNames) return 0;
-  if (!resolveShortNames(files, count, shortNames)) { free(shortNames); return 0; }
+// ---------------------------------------------------------------------------
+// layout
+// ---------------------------------------------------------------------------
+bool layout(const FileEntry* files, uint32_t count, Volume* out) {
+  if (!out) return false;
+  if (count > MAX_FILES) return false;
+  if (count && !files) return false;
 
-  uint32_t rootSlot = 1;            // slot 0 = volume label
-  uint32_t nextCluster = 2;
+  out->fileCount = count;
+  out->rootEntries = 1;                     // slot 0 = volume label
+  uint32_t nextCluster = 2;                 // clusters 0 and 1 are reserved
 
   for (uint32_t i = 0; i < count; i++) {
-    const char* nm = files[i].name;
-    uint32_t nameLen = (uint32_t)strlen(nm);
-    if (nameLen > 255) { free(shortNames); return 0; }
+    if (!files[i].name) return false;
+    uint32_t nameLen = (uint32_t)strlen(files[i].name);
+    if (nameLen == 0 || nameLen > 255) return false;   // VFAT limit
 
-    uint16_t units[256];
-    for (uint32_t k = 0; k < nameLen; k++) units[k] = (uint16_t)(uint8_t)nm[k]; // ASCII
-    uint32_t unitCount = nameLen + 1;              // + null terminator
-    uint32_t lfnCount = (unitCount + 12) / 13;     // 13 chars per entry
+    uint32_t lfnCount = lfnEntryCount(files[i].name, nameLen);
+    if (out->rootEntries + lfnCount + 1 > ROOT_ENTRIES) return false;
 
-    uint32_t clustersNeeded = files[i].size
+    uint32_t clusters = files[i].size
         ? (files[i].size + CLUSTER_SIZE - 1) / CLUSTER_SIZE : 0;
+    if (clusters && nextCluster + clusters - 1 > LAST_CLUSTER) return false;
 
-    if (rootSlot + lfnCount + 1 > ROOT_ENTRIES) { free(shortNames); return 0; }
-    if (clustersNeeded && nextCluster + clustersNeeded - 1 > LAST_CLUSTER) {
-      free(shortNames); return 0;
-    }
-
-    uint16_t firstCluster = 0;
-    if (clustersNeeded) {
-      firstCluster = (uint16_t)nextCluster;
-      for (uint32_t c = 0; c < clustersNeeded; c++) {
-        uint32_t cl = nextCluster + c;
-        uint16_t next = (c == clustersNeeded - 1) ? 0xFFFF : (uint16_t)(cl + 1);
-        setFatEntry(buf, cl, next);
-      }
-      uint32_t remaining = files[i].size;
-      uint32_t srcOff = 0;
-      for (uint32_t c = 0; c < clustersNeeded; c++) {
-        uint32_t cl = nextCluster + c;
-        uint32_t chunk = remaining < CLUSTER_SIZE ? remaining : CLUSTER_SIZE;
-        uint8_t* dst = dataPtr(buf, cl);
-        if (chunk) {
-          if (!reader(ctx, i, srcOff, dst, chunk)) { free(shortNames); return 0; }
-          memset(dst + chunk, 0, CLUSTER_SIZE - chunk);
-        } else {
-          memset(dst, 0, CLUSTER_SIZE);
-        }
-        srcOff += chunk;
-        remaining -= chunk;
-      }
-      nextCluster += clustersNeeded;
-    }
-
-    // LFN entries: chunk (N-1) first (seq 0x40|N) ... chunk 0 last (seq 1)
-    uint8_t checksum = lfnChecksum((const uint8_t*)shortNames[i].bytes);
-    uint8_t* slot = rootDir + rootSlot * 32;
-    for (uint32_t e = 0; e < lfnCount; e++) {
-      uint32_t chunkIndex = lfnCount - 1 - e;
-      uint16_t chunk[13];
-      for (int k = 0; k < 13; k++) {
-        uint32_t idx = chunkIndex * 13 + k;
-        if (idx < nameLen)       chunk[k] = units[idx];
-        else if (idx == nameLen) chunk[k] = 0x0000;
-        else                     chunk[k] = 0xFFFF;
-      }
-      uint8_t seq = (uint8_t)(chunkIndex + 1);
-      if (chunkIndex == lfnCount - 1) seq |= 0x40;
-      writeLfnEntry(slot, seq, chunk, checksum);
-      slot += 32;
-      rootSlot++;
-    }
-
-    writeShortEntry(slot, (const uint8_t*)shortNames[i].bytes, firstCluster, files[i].size);
-    rootSlot++;
+    out->files[i].startCluster = clusters ? nextCluster : 0;
+    out->files[i].clusters = clusters;
+    out->rootEntries += lfnCount + 1;
+    nextCluster += clusters;
   }
 
-  free(shortNames);
-  return TOTAL_BYTES;
+  ShortName names[MAX_FILES];
+  if (!resolveShortNames(files, count, names)) return false;
+  for (uint32_t i = 0; i < count; i++) memcpy(out->files[i].shortName, names[i].bytes, 11);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// volume contents
+// ---------------------------------------------------------------------------
+// The FAT of a volume whose files occupy contiguous runs: every cluster points
+// at the next one, and the last of a run is the end-of-chain marker. Clusters
+// that belong to no file are free (0).
+static void writeFatSector(const Volume& vol, uint32_t sectorInFat, uint8_t* dst) {
+  const uint32_t entriesPerSector = BYTES_PER_SECTOR / 2;
+  uint32_t first = sectorInFat * entriesPerSector;
+  for (uint32_t i = 0; i < entriesPerSector; i++) {
+    uint32_t cluster = first + i;
+    uint16_t value = 0;
+    if (cluster == 0) {
+      value = 0xFFF8;                                  // media descriptor
+    } else if (cluster == 1) {
+      value = 0xFFFF;
+    } else if (cluster <= LAST_CLUSTER) {
+      for (uint32_t f = 0; f < vol.fileCount; f++) {
+        const Placement& p = vol.files[f];
+        if (!p.clusters) continue;
+        if (cluster < p.startCluster || cluster >= p.startCluster + p.clusters) continue;
+        value = (cluster == p.startCluster + p.clusters - 1)
+              ? 0xFFFF : (uint16_t)(cluster + 1);
+        break;
+      }
+    }
+    put16(dst + i * 2, value);
+  }
+}
+
+// One 512-byte root-directory sector (16 entries), starting at `firstEntry`.
+// Entries past the last file are zero, which is the directory's end marker.
+static bool writeRootSector(const Volume& vol, const FileEntry* files,
+                            uint32_t sectorInRoot, uint8_t* dst) {
+  const uint32_t firstEntry = sectorInRoot * (BYTES_PER_SECTOR / 32);
+  const uint32_t lastEntry  = firstEntry + BYTES_PER_SECTOR / 32;
+  memset(dst, 0, BYTES_PER_SECTOR);
+
+  uint32_t slot = 0;
+  struct Emitter {
+    uint8_t* dst; uint32_t first, last, slot;
+    void emit(const uint8_t* entry) {
+      if (slot >= first && slot < last) memcpy(dst + (slot - first) * 32, entry, 32);
+      slot++;
+    }
+  } out = { dst, firstEntry, lastEntry, 0 };
+
+  {                                        // volume label, matching the boot sector
+    uint8_t e[32];
+    memset(e, 0, 32);
+    memcpy(e, VOLUME_LABEL, 11);
+    e[11] = 0x08;                           // volume label attribute
+    out.emit(e);
+  }
+
+  for (uint32_t i = 0; i < vol.fileCount; i++) {
+    const char* name = files[i].name;
+    uint32_t nameLen = (uint32_t)strlen(name);
+    uint32_t lfnCount = lfnEntryCount(name, nameLen);
+    uint8_t checksum = lfnChecksum(vol.files[i].shortName);
+
+    if (out.slot < lastEntry) {              // skip whole files we are past
+      for (uint32_t e = 0; e < lfnCount; e++) {
+        uint32_t chunkIndex = lfnCount - 1 - e;
+        uint8_t entry[32];
+        writeOneLfnChunk(name, nameLen, chunkIndex, lfnCount, checksum, entry);
+        out.emit(entry);
+      }
+      uint8_t entry[32];
+      writeShortEntry(entry, vol.files[i].shortName,
+                      (uint16_t)vol.files[i].startCluster, files[i].size);
+      out.emit(entry);
+    } else {
+      out.slot += lfnCount + 1;
+    }
+  }
+  return true;
+}
+
+// File data: clusters map straight onto offsets inside a file. Anything past the
+// end of the last cluster's worth of data reads as zero, so a partial final
+// cluster looks the same as it does on a real disk.
+static bool readDataRange(const Volume& vol, const FileEntry* files, FileReader reader,
+                          void* ctx, uint32_t dataOffset, uint8_t* dst, uint32_t len) {
+  while (len) {
+    uint32_t cluster   = 2 + dataOffset / CLUSTER_SIZE;
+    uint32_t inCluster = dataOffset % CLUSTER_SIZE;
+    uint32_t chunk = CLUSTER_SIZE - inCluster;
+    if (chunk > len) chunk = len;
+
+    const Placement* owner = nullptr;
+    for (uint32_t i = 0; i < vol.fileCount; i++) {
+      const Placement& p = vol.files[i];
+      if (!p.clusters) continue;
+      if (cluster >= p.startCluster && cluster < p.startCluster + p.clusters) {
+        owner = &p;
+        break;
+      }
+    }
+
+    uint32_t copied = 0;
+    if (owner) {
+      uint32_t fileIndex = (uint32_t)(owner - vol.files);
+      uint32_t fileOffset = (cluster - owner->startCluster) * CLUSTER_SIZE + inCluster;
+      uint32_t size = files[fileIndex].size;
+      if (fileOffset < size) {
+        uint32_t n = size - fileOffset;
+        if (n > chunk) n = chunk;
+        if (n && !reader(ctx, fileIndex, fileOffset, dst, n)) return false;
+        copied = n;
+      }
+    }
+    if (copied < chunk) memset(dst + copied, 0, chunk - copied);
+
+    dst += chunk;
+    dataOffset += chunk;
+    len -= chunk;
+  }
+  return true;
+}
+
+static bool emitSector(const Volume& vol, const FileEntry* files, FileReader reader,
+                       void* ctx, uint32_t sector, uint8_t* dst) {
+  if (sector == 0) { writeBootSector(dst); return true; }
+  if (sector < FAT1_SECTOR) { memset(dst, 0, BYTES_PER_SECTOR); return true; }   // reserved
+  if (sector < FAT2_SECTOR) { writeFatSector(vol, sector - FAT1_SECTOR, dst); return true; }
+  if (sector < ROOT_SECTOR) { writeFatSector(vol, sector - FAT2_SECTOR, dst); return true; }
+  if (sector < DATA_SECTOR) { return writeRootSector(vol, files, sector - ROOT_SECTOR, dst); }
+  return readDataRange(vol, files, reader, ctx,
+                       (sector - DATA_SECTOR) * BYTES_PER_SECTOR, dst, BYTES_PER_SECTOR);
+}
+
+bool readBytes(const Volume& vol, const FileEntry* files, FileReader reader,
+               void* ctx, uint32_t off, uint8_t* dst, uint32_t len) {
+  if (off > TOTAL_BYTES || len > TOTAL_BYTES - off) return false;
+  if (!len) return true;
+  if (!dst) return false;
+  if (vol.fileCount && !files) return false;
+
+  while (len) {
+    uint32_t sector   = off / BYTES_PER_SECTOR;
+    uint32_t inSector = off % BYTES_PER_SECTOR;
+    uint32_t chunk = BYTES_PER_SECTOR - inSector;
+    if (chunk > len) chunk = len;
+
+    if (inSector == 0 && chunk == BYTES_PER_SECTOR) {
+      if (!emitSector(vol, files, reader, ctx, sector, dst)) return false;
+    } else {
+      uint8_t tmp[BYTES_PER_SECTOR];
+      if (!emitSector(vol, files, reader, ctx, sector, tmp)) return false;
+      memcpy(dst, tmp + inSector, chunk);
+    }
+
+    dst += chunk;
+    off += chunk;
+    len -= chunk;
+  }
+  return true;
 }
 
 } // namespace fat16

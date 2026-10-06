@@ -8,6 +8,11 @@
 # Any single filename is uploaded as-is (that is how you push FF.CFG); the
 # directory form filters to *.adf.
 #
+# The stick stores the name you send; the 8.3 name the Gotek's directory entry
+# needs is generated from it at build time, so nothing is renamed here. A name
+# the stick's filesystem cannot hold (a uploadfs-seeded FS caps names at 32
+# bytes) is stored under a shortened, stable form — the UART log reports it.
+#
 # NOTE: the default host is the mDNS name cursed.local. mDNS is link-local
 # multicast and does NOT cross a router or a VLAN, so if this PC is not on the
 # same layer-2 network as the stick the name will not resolve — set CURSED_HOST

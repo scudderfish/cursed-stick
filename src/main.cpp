@@ -14,6 +14,7 @@
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <esp_heap_caps.h>
+#include <errno.h>
 
 #include "fat16.h"
 
@@ -23,6 +24,16 @@
 // ---------------------------------------------------------------------------
 #define HOSTNAME    "cursed"
 #define MAX_FILES   64
+
+// Longest filename an upload will try to store: 255 bytes, the VFAT LFN limit —
+// which is also what a firmware-formatted LittleFS accepts (measured on
+// hardware: 255 stored verbatim, 256 refused). A LittleFS image written by
+// `pio run -t uploadfs` is capped at 32 bytes instead (mklittlefs records
+// name_max = 32 in the superblock and lfs_mount() adopts it for the life of that
+// image), so handleUploadBody() walks progressively smaller budgets and stores
+// the longest deterministic shortening the filesystem takes; a name that fits is
+// stored exactly as sent.
+#define STORAGE_NAME_MAX 255
 
 // ---------------------------------------------------------------------------
 // USB mass storage (read-only)
@@ -244,11 +255,19 @@ static void handleRoot() {
   server.send(200, "text/html", html);
 }
 
-static bool    uploadOk = false;
+static bool    uploadOk = false;        // image rebuilt with the new file
+static bool    uploadFailed = false;    // could not name or store the file
+static bool    uploadCreated = false;   // the file exists on the stick
 static File    uploadFile;
-static String  uploadName;
+static String  uploadName;              // name the file is stored (and shown) as
+static String  uploadOriginal;          // name the client sent us
 
 static void handleUploadDone() {
+  if (uploadFailed) {
+    // Never report success for a file that is not on the stick.
+    server.send(500, "text/plain", "cannot store '" + uploadOriginal + "'");
+    return;
+  }
   if (!uploadOk) {
     server.send(507, "text/plain", "image full");
     return;
@@ -262,15 +281,85 @@ static void handleUploadDone() {
 static void handleUploadBody() {
   HTTPUpload& u = server.upload();
   if (u.status == UPLOAD_FILE_START) {
-    uploadName = u.filename;
-    int slash = uploadName.lastIndexOf('/');
-    if (slash >= 0) uploadName = uploadName.substring(slash + 1);
-    if (uploadName.length() == 0) uploadName = "unnamed.adf";
+    uploadOk = false;
+    uploadFailed = false;
+    uploadCreated = false;
+
+    uploadOriginal = u.filename;
+    // A multipart filename can carry a path prefix (some clients send the whole
+    // client-side path). Keep the basename, whatever separator was used.
+    int cut = uploadOriginal.lastIndexOf('/');
+    int bslash = uploadOriginal.lastIndexOf('\\');
+    if (bslash > cut) cut = bslash;
+    if (cut >= 0) uploadOriginal = uploadOriginal.substring(cut + 1);
+    if (uploadOriginal.length() == 0) uploadOriginal = "unnamed.adf";
+    uploadName = uploadOriginal;
+
+    // Store the name the client sent wherever the filesystem allows it: it does
+    // NOT have to be an 8.3 name, because the name the Gotek sees is generated
+    // from whatever is stored (rebuildImage() -> fat16::build() makes the short
+    // name and the VFAT LFN). LittleFS can still refuse a long name outright,
+    // though — a filesystem written by `pio run -t uploadfs` keeps its 32-byte
+    // name_max for the rest of its life (mklittlefs records it in the superblock
+    // and lfs_mount() adopts it, see AGENTS.md) — so fall back to the longest
+    // deterministic shortening the filesystem actually accepts.
+    errno = 0;
     uploadFile = LittleFS.open("/" + uploadName, "w");
+    if (!uploadFile) {
+      Serial.printf("UPLOAD: cannot store '%s' (errno %d%s)\n",
+                    uploadOriginal.c_str(), errno,
+                    errno == ENAMETOOLONG ? ", name limit" : "");
+      // Walk the budgets down: a firmware-formatted filesystem takes up to
+      // STORAGE_NAME_MAX, an `uploadfs`-seeded one stops at 32. The first budget
+      // that both yields a name and opens it wins, and if none does the "no room"
+      // path below fails the upload instead of dropping it silently.
+      static const uint32_t budgets[] = { STORAGE_NAME_MAX, 192, 128, 64, 32, 16 };
+      char shorter[STORAGE_NAME_MAX + 1];
+      for (uint32_t budget : budgets) {
+        if (!fat16::storableName(uploadOriginal.c_str(), budget, shorter)) continue;
+        uploadName = shorter;
+        uploadFile = LittleFS.open("/" + uploadName, "w");
+        if (uploadFile) break;
+      }
+    }
+    uploadCreated = uploadFile;      // a false File means every open failed
+    if (!uploadCreated) {
+      Serial.printf("UPLOAD: no room for '%s' on the stick\n", uploadOriginal.c_str());
+      uploadFailed = true;
+      return;
+    }
+    if (uploadName == uploadOriginal)
+      Serial.printf("UPLOAD: storing '%s'\n", uploadName.c_str());
+    else
+      Serial.printf("UPLOAD: storing '%s' as '%s'\n",
+                    uploadOriginal.c_str(), uploadName.c_str());
   } else if (u.status == UPLOAD_FILE_WRITE) {
-    if (uploadFile) uploadFile.write(u.buf, u.currentSize);
+    // A short write means the file on the stick is not the file the client sent.
+    if (uploadCreated && uploadFile.write(u.buf, u.currentSize) != u.currentSize) {
+      Serial.printf("UPLOAD: short write on '%s'\n", uploadName.c_str());
+      uploadFailed = true;
+    }
   } else if (u.status == UPLOAD_FILE_END) {
-    if (uploadFile) uploadFile.close();
+    if (uploadCreated) uploadFile.close();
+
+    if (uploadFailed) {
+      if (!uploadCreated) {
+        // Nothing reached the stick (the name could not be generated or the file
+        // could not be created), so the image is untouched.
+        Serial.printf("UPLOAD: '%s' not stored; image unchanged\n",
+                      uploadOriginal.c_str());
+        return;
+      }
+      // Remove the partial file so nothing half-written is left behind.
+      tud_disconnect();
+      delay(30);
+      bool removed = LittleFS.remove("/" + uploadName);
+      Serial.printf("UPLOAD: '%s' discarded; remove -> %s\n",
+                    uploadName.c_str(), removed ? "ok" : "FAILED");
+      rebuildImage();
+      tud_connect();
+      return;
+    }
 
     // Rebuild while the host is disconnected to avoid torn reads.
     tud_disconnect();

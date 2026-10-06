@@ -72,6 +72,50 @@ Each upload rebuilds the image and re-enumerates the USB device, so the new
 files appear on the Gotek immediately; in a browser the page returns to the
 file list once the upload finishes.
 
+The stick stores the filename you send, and the name the Gotek sees is generated
+from what is stored: an 8.3 short name plus a VFAT long-name entry, so
+`Turrican II.adf` stays `Turrican II.adf` on the Gotek and in the file list even
+though the directory entry is `TURRIC~1.ADF`. The two names are independent —
+nothing on the stick is renamed to please the FAT layer.
+
+The one exception is a filesystem that cannot hold the name at all: an image
+written by `pio run -t uploadfs` is capped at 32 bytes by mklittlefs, and a
+longer name is stored under a shortened but stable form instead
+(`Workbench v3.1 rev 40.42 (1994)(Commodore)(Disk 1 of 6)(Install).adf` becomes
+`Workbench v3.1 rev 40~0882ee.adf` — same extension, and the same input always
+maps to the same name so re-uploading replaces rather than duplicates). Uploads
+that cannot be stored at all are reported as an HTTP `500` and the partial file
+is removed rather than being silently dropped; the UART log names the file and
+the reason (`errno`).
+
+That 32-byte cap lives in the filesystem, not the firmware, and only because it
+was *seeded*: the firmware formats the partition with a 255-byte limit. To remove
+it, erase just the filesystem partition and reboot — the next mount finds nothing
+and formats it itself, after which full-length names are stored verbatim:
+
+```bash
+pio pkg exec -p tool-esptoolpy -- esptool.py --chip esp32s3 --port <uart-port> \
+    erase_region 0x610000 0x9F0000
+```
+
+`<uart-port>` is the WCH UART bridge you flash over — the same one as `pio run -t
+upload`. Do not use the native USB (OTG) port: it is the one wired to the Gotek
+and it cannot reset the chip. The `ttyACM`/`ttyUSB` number is not stable across
+plug-ins, so check with `pio device list` (the bridge shows as `1a86:55d3`).
+`erase_region` wants a 4096-byte-aligned address and size — `0x610000`/`0x9F0000`
+is exactly the filesystem partition from `partitions.csv`. (`pio pkg exec` finds
+PlatformIO's esptool; a bare `python -m esptool` does **not** work on this
+machine — esptool and pyserial live only in PlatformIO's environment. The
+equivalent explicit form is `~/.platformio/penv/bin/python
+~/.platformio/packages/tool-esptoolpy/esptool.py …`.)
+
+This deletes the ADFs on the stick (re-push them), and do **not** follow it with
+`pio run -t uploadfs`, which would impose the 32-byte limit all over again. Back
+up anything you cannot simply re-push first — a raw
+`read_flash 0x610000 0x9F0000` dump can be read back with `littlefs-python` (the
+exact call is in AGENTS.md), which is the only way to recover a file that exists
+nowhere else.
+
 Browsing to the stick's address gives the file list, an upload form, and a
 **delete** button per file (deleting also re-enumerates USB, so the Gotek
 re-scans):

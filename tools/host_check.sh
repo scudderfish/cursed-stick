@@ -22,6 +22,12 @@ fsck.fat -n "$WORK/gotek.img"
 echo "== mdir (LFN names roundtrip) =="
 mdir -i "$WORK/gotek.img" ::
 
+# mtools reads '[' ']' as wildcard classes: a 255-byte name containing them
+# cannot be read back by `mcopy "::name"` even from an image mtools wrote
+# itself, while the same length without brackets round-trips fine. Keep the
+# fixtures free of brackets (dump_image.cpp's long fixture is), and do not chase
+# a "not found" here as a fat16::build() bug — verify with `mdir` (full LFN) and
+# by reading the file's short name.
 echo "== mcopy data roundtrip =="
 fail=0
 for f in "$WORK"/expected/*; do

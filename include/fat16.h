@@ -47,4 +47,17 @@ uint32_t build(uint8_t* buf, const FileEntry* files, uint32_t fileCount,
 // LFN checksum over an 11-byte 8.3 short name (exposed for the host test harness).
 uint8_t lfnChecksum(const uint8_t shortName[11]);
 
+// Storage-safe name for `name`, for when the filesystem refuses the name the
+// client sent (a LittleFS seeded with `pio run -t uploadfs` is capped at 32
+// bytes for good — see AGENTS.md). `name` that already fits `maxLen` is
+// returned unchanged. Otherwise the stem is truncated so that
+// "STEM~DDDDDD.EXT" fits: the whole extension is kept (FlashFloppy picks the
+// image handler from it) along with a 6-hex-digit digest of the full name, so
+// the same client name always maps to the same stored name (a re-upload
+// replaces its file) while look-alike names stay apart. The name presented over
+// USB is generated from whatever ends up stored, so it does not have to be the
+// name we store. Returns false when even the digest and extension do not fit.
+// `out` must have room for maxLen + 1 bytes.
+bool storableName(const char* name, uint32_t maxLen, char* out);
+
 } // namespace fat16
